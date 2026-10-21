@@ -1,0 +1,5 @@
+streamlit>=1.36,<2.0
+finance-datareader>=0.9.96
+pandas>=2.0,<3.0
+requests>=2.31
+streamlit-autorefresh>=1.0.1
