@@ -1,4 +1,3 @@
-"""Korean single-candidate swing scanner. Research only; never places orders."""
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
@@ -302,6 +301,29 @@ def scan_market(market: str, universe_size: int, progress_callback=None) -> tupl
     return found, errors, diagnostics
 
 
+
+def _sync_saved_checkbox(code: str, source_key: str) -> None:
+    """Keep the ranking and Saved checkboxes synchronized for this Streamlit session."""
+    saved = set(st.session_state.get("saved_codes", []))
+    checked = bool(st.session_state.get(source_key, False))
+    if checked:
+        saved.add(code)
+    else:
+        saved.discard(code)
+    st.session_state.saved_codes = sorted(saved)
+    # Set both widget states in the callback, before the next render creates either widget.
+    for prefix in ("rank_save_", "saved_save_"):
+        st.session_state[f"{prefix}{code}"] = checked
+
+
+def _reanalyze_one_saved_stock(code: str, name: str) -> dict[str, Any] | None:
+    """Refresh only one saved ticker using the app's unchanged entry rules."""
+    today = datetime.now(ZoneInfo("Asia/Seoul")).date()
+    start = today - timedelta(days=180)
+    end_exclusive = today + timedelta(days=1)
+    hist = get_history(code, start.isoformat(), end_exclusive.isoformat())
+    return analyze_one(code, name, hist, today) if not hist.empty else None
+
 with st.expander("분석 설정", expanded=True):
     market = st.selectbox("분석 시장", ["KRX", "KOSPI", "KOSDAQ"], index=0)
     universe_size = st.select_slider("분석 종목 수", options=[200, 500, 1000, 1500], value=500)
@@ -367,6 +389,12 @@ st.session_state.scan_errors = task.get("errors", []) if task else []
 st.session_state.scan_diagnostics = task.get("diagnostics", []) if task else []
 
 results = st.session_state.scan_results
+if "saved_codes" not in st.session_state:
+    st.session_state.saved_codes = []
+
+# Map all results by code so Saved entries can be rendered even if they are outside the top 10.
+results_by_code = {item["code"]: item for item in (results or [])}
+
 if results is None and (not task or task.get("status") not in ("queued", "running")):
     st.info("분석을 시작하려면 위의 **알려줘** 버튼을 한 번 누르세요.")
 elif task and task.get("status") in ("queued", "running"):
@@ -379,89 +407,142 @@ elif not results:
         with st.expander("오류 확인"):
             for err in st.session_state.scan_errors:
                 st.write(f"- {err}")
-    st.caption("조건을 충족하는 종목이 없을 때는 억지로 종목을 추천하지 않습니다.")
+    st.caption("조건을 충족하는 종목이 없을 때는 억지로 매수 신호를 만들지 않습니다.")
 else:
-    # Show exactly one actionable candidate. Other rows are not presented as recommendations.
-    r = next((item for item in results if item["signal"]), None)
-    if r is None:
-        st.warning("모든 최종 진입 조건을 충족한 종목은 없습니다. 아래는 조건에 가까운 검색 후보이며, 매수 신호가 아닙니다.")
-        st.caption("후보 검색 범위는 넓혔지만, 실제 진입 가능 판정 기준은 기존과 동일합니다.")
-        near = sorted(
-            results,
-            key=lambda item: (
-                item["fresh"], item["candidate_score"], item["trend"], item["breakout"],
-                item["turnover_ratio"], item["volume_ratio"]
-            ),
-            reverse=True,
-        )[:5]
-        rows = []
-        for item in near:
-            rows.append({
-                "종목": f'{item["name"]} ({item["code"]})',
-                "기준일": item["date"],
-                "데이터 상태": ("최신" if item["fresh"] else f"오래됨({item['age_days']}일)"),
-                "종가(원)": round(item["close"]),
-                "충족 조건": f'{item["candidate_score"]}/7',
-                "거래대금(추정, 억 원)": round(item["turnover"] / 100_000_000, 2),
-                "거래대금 증가": f'{item["turnover_ratio"]:.2f}배',
-                "거래량 증가": f'{item["volume_ratio"]:.2f}배',
-                "당일 등락률": f'{item["daily_pct"]:+.2f}%',
-                "미충족 조건": ", ".join(item["failed_checks"]) or "없음",
-            })
-        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
-        st.info("표의 종목은 확인용 후보입니다. 데이터 상태가 ‘오래됨’이면 진입 조건을 만족해 보여도 실제 진입 신호로 인정하지 않습니다.")
+    st.subheader("종목 후보 순위 TOP 10")
+    st.caption("순위는 기존 후보 점수와 지표를 바탕으로 한 확인용 정렬입니다. 1위도 자동 매수 신호를 뜻하지 않습니다. 체크하면 아래 ‘저장’에 추가됩니다.")
+    ranked = results[:10]
+    for rank, item in enumerate(ranked, start=1):
+        code = item["code"]
+        name = item["name"]
+        saved = code in set(st.session_state.saved_codes)
+        with st.container(border=True):
+            left, middle, right = st.columns([0.7, 3.2, 1.2])
+            left.markdown(f"### {rank}")
+            middle.markdown(f"**{name} ({code})**")
+            status = "진입 조건 충족" if item["signal"] else f"후보 조건 {item['candidate_score']}/7"
+            freshness = "최신 데이터" if item["fresh"] else f"오래된 데이터({item['age_days']}일)"
+            middle.caption(f"{status} · {freshness} · 기준일 {item['date']}")
+            middle.write(f"종가 {item['close']:,.0f}원 · 당일 {item['daily_pct']:+.2f}% · 거래대금 증가 {item['turnover_ratio']:.2f}배 · 거래량 증가 {item['volume_ratio']:.2f}배")
+            right.checkbox(
+                "저장", value=saved, key=f"rank_save_{code}",
+                on_change=_sync_saved_checkbox, args=(code, f"rank_save_{code}"),
+            )
+            if item["signal"]:
+                st.success("기존 최종 진입 조건을 충족함 — 최신 호가·공시를 별도로 확인하세요.")
+            else:
+                st.caption("미충족 조건: " + (", ".join(item["failed_checks"]) or "없음"))
+
+    # Preserve the original detailed analysis panel for the highest-ranked actual signal.
+    signal_item = next((item for item in results if item["signal"]), None)
+    if signal_item is not None:
+        r = signal_item
+        with st.expander(f"진입 조건 충족 종목 상세: {r['name']} ({r['code']})", expanded=True):
+            st.caption(f"기준 데이터: {r['date']} · 데이터 나이: {r['age_days']}일 · 종목 코드: {r['code']}")
+            st.metric("최근 종가", f"{r['close']:,.0f}원", f"{r['daily_pct']:+.2f}%")
+            a, b, c = st.columns(3)
+            a.metric("진입 기준가", f"{r['entry']:,.0f}원")
+            b.metric("손절 기준가", f"{r['stop']:,.0f}원", f"-{(r['entry']-r['stop'])/r['entry']*100:.2f}%")
+            c.metric("목표 기준가", f"{r['target']:,.0f}원", f"+{(r['target']-r['entry'])/r['entry']*100:.2f}%")
+            st.subheader("30만 원 기준 매수 수량 계산")
+            x, y, z = st.columns(3)
+            x.metric("계산 수량", f"{r['shares']}주")
+            y.metric("예상 사용 금액", f"{r['estimated_cost']:,.0f}원")
+            z.metric("계획 손실 예산", f"{r['risk_budget']:,.0f}원")
+            st.caption(f"계산상 손절 폭 기준 손실 예상액: {r['planned_risk']:,.0f}원(수수료·세금·슬리피지 제외). 갭 하락 등으로 실제 손실은 더 커질 수 있습니다.")
+            st.subheader("진입 조건 점검")
+            checks = [
+                ("종가 > 20일 이동평균 > 50일 이동평균", r["trend"]),
+                ("종가가 직전 20거래일 고점을 돌파", r["breakout"]),
+                ("추정 당일 거래대금 10억 원 이상", r["liquid"]),
+                (f"거래대금이 직전 20일 평균의 {MIN_TURNOVER_RATIO:.1f}배 이상", r["turnover_ratio"] >= MIN_TURNOVER_RATIO),
+                (f"거래량이 직전 20일 평균의 {MIN_VOLUME_RATIO:.1f}배 이상", r["volume_ratio"] >= MIN_VOLUME_RATIO),
+                (f"당일 상승률 0% 이상 {MAX_DAILY_CHANGE_PCT:.1f}% 미만", 0 <= r["daily_pct"] < MAX_DAILY_CHANGE_PCT),
+                (f"데이터가 {MAX_DATA_AGE_DAYS}일 이내", r["fresh"]),
+            ]
+            for label, ok in checks:
+                st.write(("✅ " if ok else "❌ ") + label)
+            st.subheader("보조 지표")
+            d1, d2, d3 = st.columns(3)
+            d1.metric("거래대금 증가", f"{r['turnover_ratio']:.2f}배")
+            d2.metric("거래량 증가", f"{r['volume_ratio']:.2f}배")
+            d3.metric("ATR(14)", f"{r['atr']:,.0f}원")
+            export = pd.DataFrame([{
+                "기준일": r["date"], "종목명": r["name"], "종목코드": r["code"],
+                "최근종가(원)": round(r["close"]), "진입기준가(원)": round(r["entry"]),
+                "손절기준가(원)": round(r["stop"]), "목표기준가(원)": round(r["target"]),
+                "계산매수수량(주)": r["shares"], "예상사용금액(원)": round(r["estimated_cost"]),
+                "계획손실예산(원)": round(r["risk_budget"]), "거래대금증가배수": round(r["turnover_ratio"], 2),
+                "거래량증가배수": round(r["volume_ratio"], 2), "당일등락률(%)": round(r["daily_pct"], 2),
+            }])
+            st.download_button(
+                "분석 결과 CSV 저장", export.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"스윙분석_{r['code']}_{r['date']}.csv", mime="text/csv", use_container_width=True,
+            )
+
+# Saved is always at the bottom and can be collapsed/expanded.
+st.divider()
+with st.expander(f"저장 ({len(st.session_state.saved_codes)})", expanded=False):
+    saved_codes = list(st.session_state.saved_codes)
+    if not saved_codes:
+        st.info("저장한 종목이 없습니다. 위 순위 목록에서 ‘저장’을 체크하세요.")
     else:
-        st.success("진입 조건 충족 후보가 발견되었습니다. 아래 가격은 규칙 기반 참고값이며 주문 권고가 아닙니다.")
-        st.caption(f"기준 데이터: {r['date']} · 데이터 나이: {r['age_days']}일 · 종목 코드: {r['code']}")
-        st.subheader(f"{r['name']} ({r['code']})")
-        st.metric("최근 종가", f"{r['close']:,.0f}원", f"{r['daily_pct']:+.2f}%")
-        a, b, c = st.columns(3)
-        a.metric("진입 기준가", f"{r['entry']:,.0f}원")
-        b.metric("손절 기준가", f"{r['stop']:,.0f}원", f"-{(r['entry']-r['stop'])/r['entry']*100:.2f}%")
-        c.metric("목표 기준가", f"{r['target']:,.0f}원", f"+{(r['target']-r['entry'])/r['entry']*100:.2f}%")
-        st.subheader("30만 원 기준 매수 수량 계산")
-        x, y, z = st.columns(3)
-        x.metric("계산 수량", f"{r['shares']}주")
-        y.metric("예상 사용 금액", f"{r['estimated_cost']:,.0f}원")
-        z.metric("계획 손실 예산", f"{r['risk_budget']:,.0f}원")
-        st.caption(
-            f"계산상 손절 폭 기준 손실 예상액: {r['planned_risk']:,.0f}원(수수료·세금·슬리피지 제외). "
-            "갭 하락 등으로 실제 손실은 더 커질 수 있습니다."
-        )
-        st.subheader("진입 조건 점검")
-        checks = [
-            ("종가 > 20일 이동평균 > 50일 이동평균", r["trend"]),
-            ("종가가 직전 20거래일 고점을 돌파", r["breakout"]),
-            ("추정 당일 거래대금 10억 원 이상", r["liquid"]),
-            (f"거래대금이 직전 20일 평균의 {MIN_TURNOVER_RATIO:.1f}배 이상", r["turnover_ratio"] >= MIN_TURNOVER_RATIO),
-            (f"거래량이 직전 20일 평균의 {MIN_VOLUME_RATIO:.1f}배 이상", r["volume_ratio"] >= MIN_VOLUME_RATIO),
-            (f"당일 상승률 0% 이상 {MAX_DAILY_CHANGE_PCT:.1f}% 미만", 0 <= r["daily_pct"] < MAX_DAILY_CHANGE_PCT),
-            (f"데이터가 {MAX_DATA_AGE_DAYS}일 이내", r["fresh"]),
-        ]
-        for label, ok in checks:
-            st.write(("✅ " if ok else "❌ ") + label)
-        st.subheader("보조 지표")
-        d1, d2, d3 = st.columns(3)
-        d1.metric("거래대금 증가", f"{r['turnover_ratio']:.2f}배")
-        d2.metric("거래량 증가", f"{r['volume_ratio']:.2f}배")
-        d3.metric("ATR(14)", f"{r['atr']:,.0f}원")
-        export = pd.DataFrame([{
-            "기준일": r["date"], "종목명": r["name"], "종목코드": r["code"],
-            "최근종가(원)": round(r["close"]), "진입기준가(원)": round(r["entry"]),
-            "손절기준가(원)": round(r["stop"]), "목표기준가(원)": round(r["target"]),
-            "계산매수수량(주)": r["shares"], "예상사용금액(원)": round(r["estimated_cost"]),
-            "계획손실예산(원)": round(r["risk_budget"]), "거래대금증가배수": round(r["turnover_ratio"], 2),
-            "거래량증가배수": round(r["volume_ratio"], 2), "당일등락률(%)": round(r["daily_pct"], 2),
-        }])
-        st.download_button(
-            "분석 결과 CSV 저장", export.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"스윙분석_{r['code']}_{r['date']}.csv", mime="text/csv", use_container_width=True,
-        )
-        if st.session_state.scan_errors:
-            with st.expander("일부 종목 데이터 오류 확인"):
-                st.write("일부 종목의 데이터 요청은 실패했지만, 유효한 종목 데이터는 계속 분석했습니다.")
-                for err in st.session_state.scan_errors:
-                    st.write(f"- {err}")
+        for code in saved_codes:
+            item = results_by_code.get(code)
+            if item is None:
+                # If the most recent broad scan doesn't contain this code, retain it in Saved and allow fresh lookup.
+                name = code
+            else:
+                name = item["name"]
+            with st.container(border=True):
+                left, middle, right = st.columns([3.0, 1.0, 1.3])
+                left.markdown(f"**{name} ({code})**")
+                if item is not None:
+                    left.caption(f"최근 확인 기준일 {item['date']} · 종가 {item['close']:,.0f}원")
+                middle.checkbox(
+                    "저장", value=True, key=f"saved_save_{code}",
+                    on_change=_sync_saved_checkbox, args=(code, f"saved_save_{code}"),
+                )
+                recheck = right.button("알려줘", key=f"recheck_{code}", use_container_width=True)
+                if recheck:
+                    with st.spinner(f"{name}({code})의 최신 일봉 데이터를 다시 확인하고 있어요..."):
+                        try:
+                            checked = _reanalyze_one_saved_stock(code, name if item is not None else code)
+                            st.session_state[f"single_check_{code}"] = {
+                                "result": checked, "checked_at": datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d %H:%M:%S")
+                            }
+                        except Exception as exc:
+                            st.session_state[f"single_check_{code}"] = {
+                                "error": f"{type(exc).__name__}: {exc}", "checked_at": datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d %H:%M:%S")
+                            }
+                check_result = st.session_state.get(f"single_check_{code}")
+                if check_result:
+                    st.caption(f"개별 재분석 시각: {check_result['checked_at']} (한국 시간)")
+                    if "error" in check_result:
+                        st.error("개별 재분석 실패: " + check_result["error"] + ". 잠시 후 다시 시도하세요.")
+                    elif check_result.get("result") is None:
+                        st.warning("충분한 최신 가격 데이터가 없어 진입 시점을 판단할 수 없습니다. 매수 신호로 해석하지 마세요.")
+                    else:
+                        q = check_result["result"]
+                        st.write(f"기준일 {q['date']} · 데이터 나이 {q['age_days']}일 · 최근 종가 {q['close']:,.0f}원")
+                        if q["signal"]:
+                            st.success(f"현재 데이터 기준 기존 진입 조건 충족. 참고 진입 기준가 {q['entry']:,.0f}원 · 손절 {q['stop']:,.0f}원 · 목표 {q['target']:,.0f}원")
+                            st.write("검토 시점: 최신 호가와 공시를 확인한 뒤, 가격이 참고 진입 기준과 조건을 여전히 만족하는지 장중에 직접 확인하세요. 자동 주문은 하지 않습니다.")
+                        else:
+                            st.warning("현재 데이터 기준으로 기존 진입 조건을 모두 충족하지 않았습니다. 지금은 매수 신호가 아닙니다.")
+                            st.write("미충족 조건: " + (", ".join(q["failed_checks"]) or "없음"))
+                            if not q["fresh"]:
+                                st.write("데이터가 오래되어 진입 시점을 판단할 수 없습니다. 최신 데이터가 들어온 뒤 다시 확인하세요.")
+                            elif q["breakout"] is False:
+                                st.write(f"관찰할 조건: 종가가 직전 20거래일 고점({q['prior_20_high']:,.0f}원)을 돌파하는지 확인하세요. 돌파만으로 매수하라는 뜻은 아닙니다.")
+                            else:
+                                st.write("관찰할 조건: 미충족된 추세·거래대금·거래량·당일 상승률 조건이 충족되는지 다시 확인하세요. 날짜나 시각을 확정적으로 예측할 수는 없습니다.")
+
+if st.session_state.scan_errors:
+    with st.expander("일부 종목 데이터 오류 확인", expanded=False):
+        st.write("일부 종목의 데이터 요청은 실패했지만, 유효한 종목 데이터는 계속 분석했습니다.")
+        for err in st.session_state.scan_errors:
+            st.write(f"- {err}")
 
 st.divider()
 st.caption(
